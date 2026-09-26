@@ -6,6 +6,7 @@ and `fanqie --toggle` starts/pauses the current timer (handy for a keybind).
 """
 
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -137,6 +138,22 @@ class History:
                 (since.isoformat(timespec="seconds"),),
             ).fetchone()
         return row[0]
+
+    def daily_totals(self, since):
+        """{'YYYY-MM-DD': (seconds, sessions)} for every day on or after `since` (a date)."""
+        rows = self.db.execute(
+            "SELECT substr(started_at, 1, 10) AS day, SUM(duration), COUNT(*)"
+            " FROM sessions WHERE started_at >= ? GROUP BY day",
+            (since.isoformat(),),
+        ).fetchall()
+        return {day: (secs, count) for day, secs, count in rows}
+
+    def on_day(self, day):
+        return self.db.execute(
+            "SELECT id, mode, label, started_at, duration, target, completed"
+            " FROM sessions WHERE substr(started_at, 1, 10) = ? ORDER BY started_at DESC",
+            (day,),
+        ).fetchall()
 
     def delete(self, session_id):
         self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -355,11 +372,191 @@ class StopwatchPage(TimerPage):
         return fmt_clock(self.clock.elapsed())
 
 
+HEAT_WEEKS = 53
+HEAT_CELL = 11
+HEAT_STEP = HEAT_CELL + 3  # cell + gap
+HEAT_TOP = 16  # room for month labels
+HEAT_HEIGHT = HEAT_TOP + 7 * HEAT_STEP
+# A day reaches level 1..4 once its total passes these many seconds.
+HEAT_THRESHOLDS = (0, 25 * 60, 60 * 60, 2 * 3600)
+HEAT_LIGHT = ("#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39")
+HEAT_DARK = ("#383838", "#0e4429", "#006d32", "#26a641", "#39d353")
+
+
+def heat_level(seconds):
+    return sum(seconds > t for t in HEAT_THRESHOLDS)
+
+
+def rounded_rect(cr, x, y, size, r=2):
+    cr.new_sub_path()
+    cr.arc(x + size - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + size - r, y + size - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + size - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+class Heatmap(Gtk.Box):
+    """GitHub-style year of daily totals: columns are weeks (Mon–Sun), newest on the right."""
+
+    def __init__(self, on_select):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.on_select = on_select
+        self.days = {}
+        self.selected = None
+        self.style = Adw.StyleManager.get_default()
+        self.style.connect("notify::dark", lambda *_: self.redraw())
+
+        grid_row = Gtk.Box(spacing=4)
+        self.weekdays = Gtk.DrawingArea(content_width=26, content_height=HEAT_HEIGHT, valign=Gtk.Align.START)
+        self.weekdays.set_draw_func(self.draw_weekdays)
+        grid_row.append(self.weekdays)
+
+        self.grid = Gtk.DrawingArea(
+            content_width=HEAT_WEEKS * HEAT_STEP, content_height=HEAT_HEIGHT, margin_bottom=8,
+            has_tooltip=True,
+        )
+        self.grid.set_draw_func(self.draw_grid)
+        self.grid.connect("query-tooltip", self.on_tooltip)
+        click = Gtk.GestureClick()
+        click.connect("released", self.on_click)
+        self.grid.add_controller(click)
+
+        scroller = Gtk.ScrolledWindow(
+            child=self.grid, hexpand=True,
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, vscrollbar_policy=Gtk.PolicyType.NEVER,
+        )
+        # Keep the most recent weeks in view, like GitHub on a narrow screen.
+        scroller.get_hadjustment().connect(
+            "changed", lambda adj: adj.set_value(adj.get_upper() - adj.get_page_size())
+        )
+        grid_row.append(scroller)
+        self.append(grid_row)
+
+        footer = Gtk.Box(spacing=4)
+        self.total_label = Gtk.Label(xalign=0, hexpand=True, css_classes=["dim-label", "caption"])
+        footer.append(self.total_label)
+        footer.append(Gtk.Label(label="Less", css_classes=["dim-label", "caption"]))
+        legend = Gtk.DrawingArea(content_width=5 * HEAT_STEP, content_height=HEAT_CELL, valign=Gtk.Align.CENTER)
+        legend.set_draw_func(self.draw_legend)
+        self.legend = legend
+        footer.append(legend)
+        footer.append(Gtk.Label(label="More", css_classes=["dim-label", "caption"]))
+        self.append(footer)
+
+        self.set_range()
+
+    def set_range(self):
+        self.today = datetime.now().date()
+        self.start = self.today - timedelta(days=self.today.weekday(), weeks=HEAT_WEEKS - 1)
+
+    def set_data(self, days, selected):
+        self.set_range()
+        self.days = days
+        self.selected = selected
+        total = sum(secs for secs, _ in days.values())
+        active = sum(1 for secs, _ in days.values() if secs > 0)
+        self.total_label.set_label(f"{fmt_duration(total)} over {active} days in the last year")
+        self.redraw()
+
+    def redraw(self):
+        for area in (self.grid, self.weekdays, self.legend):
+            area.queue_draw()
+
+    def palette(self):
+        colors = HEAT_DARK if self.style.get_dark() else HEAT_LIGHT
+        out = []
+        for c in colors:
+            rgba = Gdk.RGBA()
+            rgba.parse(c)
+            out.append(rgba)
+        return out
+
+    def day_at(self, x, y):
+        col, row = int(x // HEAT_STEP), int((y - HEAT_TOP) // HEAT_STEP)
+        if y < HEAT_TOP or not (0 <= col < HEAT_WEEKS and 0 <= row < 7):
+            return None
+        day = self.start + timedelta(days=col * 7 + row)
+        return day if day <= self.today else None
+
+    def draw_grid(self, area, cr, _w, _h):
+        colors = self.palette()
+        fg = area.get_color()
+        for col in range(HEAT_WEEKS):
+            for row in range(7):
+                day = self.start + timedelta(days=col * 7 + row)
+                if day > self.today:
+                    break
+                x, y = col * HEAT_STEP, HEAT_TOP + row * HEAT_STEP
+                secs = self.days.get(day.isoformat(), (0, 0))[0]
+                Gdk.cairo_set_source_rgba(cr, colors[heat_level(secs)])
+                rounded_rect(cr, x, y, HEAT_CELL)
+                cr.fill()
+                if day.isoformat() == self.selected:
+                    cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.9)
+                    cr.set_line_width(1.5)
+                    rounded_rect(cr, x + 0.75, y + 0.75, HEAT_CELL - 1.5)
+                    cr.stroke()
+
+        # Month names above the first column of each month; drop the very first
+        # one if the next month starts too soon for both to fit.
+        marks = []
+        for col in range(HEAT_WEEKS):
+            monday = self.start + timedelta(weeks=col)
+            if col == 0 or monday.month != (monday - timedelta(weeks=1)).month:
+                marks.append((col, monday.strftime("%b")))
+        if len(marks) > 1 and marks[1][0] - marks[0][0] < 3:
+            marks.pop(0)
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.6)
+        cr.set_font_size(10)
+        for col, name in marks:
+            cr.move_to(col * HEAT_STEP, 10)
+            cr.show_text(name)
+
+    def draw_weekdays(self, area, cr, _w, _h):
+        fg = area.get_color()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.6)
+        cr.set_font_size(10)
+        for row, name in ((0, "Mon"), (2, "Wed"), (4, "Fri")):
+            cr.move_to(0, HEAT_TOP + row * HEAT_STEP + HEAT_CELL - 2)
+            cr.show_text(name)
+
+    def draw_legend(self, _area, cr, _w, _h):
+        for i, color in enumerate(self.palette()):
+            Gdk.cairo_set_source_rgba(cr, color)
+            rounded_rect(cr, i * HEAT_STEP, 0, HEAT_CELL)
+            cr.fill()
+
+    def on_tooltip(self, _area, x, y, _keyboard, tooltip):
+        day = self.day_at(x, y)
+        if day is None:
+            return False
+        secs, count = self.days.get(day.isoformat(), (0, 0))
+        when = day.strftime("%a, %b %d %Y")
+        tooltip.set_text(
+            f"{fmt_duration(secs)} · {count} session{'s' if count != 1 else ''}\n{when}"
+            if count else f"No sessions\n{when}"
+        )
+        return True
+
+    def on_click(self, _gesture, _n, x, y):
+        day = self.day_at(x, y)
+        if day is not None:
+            key = day.isoformat()
+            self.on_select(None if key == self.selected else key)
+
+
 class HistoryPage(Adw.PreferencesPage):
     def __init__(self, win):
         super().__init__()
         self.win = win
         self.groups = []
+        self.selected_day = None
+
+        activity = Adw.PreferencesGroup(title="Activity")
+        self.heatmap = Heatmap(self.select_day)
+        activity.add(self.heatmap)
+        self.add(activity)
 
         self.summary = Adw.PreferencesGroup(title="Summary")
         clear = Gtk.Button(label="Clear all", css_classes=["flat", "destructive-action"])
@@ -397,17 +594,24 @@ class HistoryPage(Adw.PreferencesPage):
         self.totals[self.week_row].set_label(fmt_duration(h.total_since(week)))
         self.totals[self.all_row].set_label(fmt_duration(h.total_since()))
 
-        rows = h.recent()
-        if not rows:
-            group = Adw.PreferencesGroup()
-            group.add(self.empty)
-            self.add(group)
-            self.groups.append(group)
-            return
+        self.heatmap.set_data(h.daily_totals(self.heatmap.start), self.selected_day)
+
+        if self.selected_day:
+            rows = h.on_day(self.selected_day)
+        else:
+            rows = h.recent()
+            if not rows:
+                group = Adw.PreferencesGroup()
+                group.add(self.empty)
+                self.add(group)
+                self.groups.append(group)
+                return
 
         by_day = {}
         for r in rows:
             by_day.setdefault(r[3][:10], []).append(r)
+        if self.selected_day and not rows:
+            by_day[self.selected_day] = []
 
         for day, sessions in by_day.items():
             date = datetime.fromisoformat(day)
@@ -419,12 +623,21 @@ class HistoryPage(Adw.PreferencesPage):
                 title = date.strftime("%a, %b %d %Y")
             total = sum(s[4] for s in sessions)
             group = Adw.PreferencesGroup(
-                title=title, description=f"{len(sessions)} sessions · {fmt_duration(total)}"
+                title=title,
+                description=f"{len(sessions)} sessions · {fmt_duration(total)}" if sessions else "No sessions",
             )
+            if self.selected_day:
+                show_all = Gtk.Button(label="Show all", css_classes=["flat"], valign=Gtk.Align.CENTER)
+                show_all.connect("clicked", lambda *_: self.select_day(None))
+                group.set_header_suffix(show_all)
             for s in sessions:
                 group.add(self.make_row(*s))
             self.add(group)
             self.groups.append(group)
+
+    def select_day(self, day):
+        self.selected_day = day
+        self.rebuild()
 
     def make_row(self, sid, mode, label, started_at, duration, target, completed):
         start = datetime.fromisoformat(started_at).strftime("%H:%M")
@@ -467,6 +680,7 @@ class HistoryPage(Adw.PreferencesPage):
     def on_clear_response(self, _dialog, response):
         if response == "clear":
             self.win.history.clear()
+            self.selected_day = None
             self.rebuild()
 
 

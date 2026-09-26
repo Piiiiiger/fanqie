@@ -27,7 +27,8 @@ bar's widget list in DankMaterialShell settings to show active tasks at the top 
 - Buttons: ↶ discards the run without saving, ▶/⏸ starts/pauses, ■ stops and saves. A countdown stopped early is
   saved with "stopped early". Runs shorter than 5 s are not saved.
 - Give each session a label in the entry box ("What are you working on?").
-- **History**: shows totals for today, this week and all time, plus sessions grouped by day. You can delete single
+- **History**: opens with a GitHub-style heatmap of the last year (hover a day for its total, click it to
+  list only that day's sessions). Below it are totals for today, this week and all time, plus sessions grouped by day. You can delete single
   entries or clear everything.
 - Starting a timer or closing the editor hides it in the system tray. Click the tray icon, or open Fanqie again, to
   change or stop the timer. The tray tooltip shows the task and time.
