@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Fanqie
+Comment=Countdown and stopwatch timer with history
+Exec=fanqie
+Icon=alarm-symbolic
+Terminal=false
+Categories=Utility;Clock;
+StartupNotify=false

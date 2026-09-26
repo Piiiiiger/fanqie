@@ -1,0 +1,18 @@
+// Add to ~/.config/niri/config.kdl
+
+window-rule {
+    match app-id=r#"^dev\.pigger\.Fanqie$"#
+    open-floating true
+    default-column-width { fixed 360; }
+    default-window-height { fixed 340; }
+    opacity 0.82
+    // Park it in the top-right corner.
+    default-floating-position x=24 y=24 relative-to="top-right"
+}
+
+binds {
+    // Open / raise the timer window.
+    Mod+Alt+T { spawn "fanqie"; }
+    // Start/pause the visible timer without switching to it.
+    Mod+Alt+Shift+T { spawn "fanqie" "--toggle"; }
+}

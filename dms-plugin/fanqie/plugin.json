@@ -1,0 +1,13 @@
+{
+  "id": "fanqie",
+  "name": "Fanqie Timer",
+  "description": "Show the active Fanqie task and time in DankBar",
+  "version": "1.0.0",
+  "author": "Local",
+  "type": "widget",
+  "capabilities": ["dankbar-widget", "monitoring"],
+  "component": "./FanqieWidget.qml",
+  "icon": "timer",
+  "requires": ["python3"],
+  "permissions": []
+}
